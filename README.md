@@ -35,7 +35,7 @@ Sibling repo: [GrainLensSol](https://github.com/anttiluode/GrainLensSol) asks ho
 
 Fixed readings:
 - The tree is in the geometry at a layer if nearest-category ≥ 0.8 and nearest-top ≥ 0.8.
-- It is Park-like there if |mean cos(true)| ≤ 0.1 while the cross null is ≤ −0.2.
+- ~~It is Park-like there if |mean cos(true)| ≤ 0.1 while the cross null is ≤ −0.2.~~ Withdrawn after the smoke run (Neon): cos(a − b, b − c) is about −0.5 for unrelated equal-norm vectors, because b enters both differences, so 0 is the wrong bar. Read the true value against the nulls (`true_minus_cross_null`, `true_minus_sib_null`).
 - Gate 0 is reported, not gated.
 
 **Gate C, calibration.**
@@ -70,10 +70,11 @@ Fixed readings:
 
 | Condition | Added to P |
 |---|---|
-| K*k* | r projected on the top-*k* PCs of **train** leaves' residues, *k* = 1, 2, 4, 8, 16 |
+| K*k* | K0 plus r (minus the mean train residue) projected on the top-*k* PCs of **centred** train residues, *k* = 1, 2, 4, 8, 16 |
 | Q*k* | r projected on *k* random directions, rescaled to the same size as K*k* |
 | S1bit | sign(r), one bit per dimension, scaled to ‖r‖ |
 | T*k* | a sibling's residue on the same top-*k* PCs: does oak's slot now answer the sibling? |
+| K0 | P plus the mean train residue: "a specific leaf of this kind, unspecified" |
 | Tfull | the sibling's whole state (the transplant ceiling) |
 
 Fixed readings (only if printed leaf − P leaf ≥ 0.25):
@@ -127,7 +128,14 @@ python3.13 rakeisuus.py --device cuda
 - **Gate 1, the clean part.** Blurring toward the category word lowers leaf specificity by 23 nats at t = 0.5 and 39 at t = 0.75. Evidence for the item's own category does not fall (+2.0, CI −2.4..+8.1). The equal-size random move does the opposite: category evidence falls (−3.5, CI −7.1..−0.6) while specificity barely moves (−1.7, CI −3.9..+0.5). The wrong-parent blur works as fixed: the category answer becomes the sibling category (1.00 at t = 0.75) while the top answer stays (1.00).
 - **An artifact the smoke exposed.** At X1 the slot holds a wrong category word and no leaf information, yet the leaf question still picked the test leaf 8/8. With no information the model prefers some names. That would fake leaf survival.
 
-**Changes after the smoke run (thresholds unchanged):**
+**Neon's audit of the smoke run** (all checked against the JSON):
+- *Sibling blend.* At M0.5, which in the smoke run is a 50/50 blend of two sibling leaves with no parent word, piano/guitar, bus/car, bee/ant and maple/oak reject both names (4/8). Category evidence rises above both endpoints in 5/8 pairs. Owl/eagle and wrench/hammer keep the item's own name.
+- *Gate 2 aliasing.* Uncentred PCs of train residues fused the shared "specific leaf, not the word" offset with train identities, so K8 turned maple into oak, owl into eagle, and bus into car. T8 = Tfull because the sibling fell back to a train leaf, whose residue is in the basis.
+- *Gate 0 bar.* The cosine threshold was ill-posed (above).
+
+**Changes after the smoke run (Gate 1 and Gate 2 thresholds unchanged):**
+- **B0.5 / B1 (report-only):** oak blended 50/50 with one sibling, and the sibling alone. Reported per leaf: both names rejected, and category evidence above both ends, with a bootstrap CI.
+- **Gate 2 centred:** PCs of centred train residues; the mean residue is added as its own condition (K0); the K, Q and T arms are all built on K0. A new column reports how often an arm names a train leaf. Aliasing to a train sibling is itself the evidence that leaf identities do not share a low-dimensional subspace.
 - Every choice is now made on evidence minus the evidence for a neutral slot, `Item: thing`, with raw choices kept beside them.
 - A report-only layer window (clamps starting at layers 4…20, without the embedding) locates where the word stops mattering at its own position.
 

@@ -370,7 +370,11 @@ def gate0(tree, S, n_layers):
                 xc = tree.cats[c["cross"]]
                 x1, x2 = S[xc["word"]][l], S[tree.tops[xc["top"]]["word"]][l]
                 cx.append(cosv(h - x1, x1 - x2))
-        rows.append(dict(layer=l, nearest_cat=mean(near_cat), nearest_top=mean(near_top),
+        # cos(a-b, b-c) is about -0.5 for unrelated equal-norm vectors (Neon), so the
+        # true value is only meaningful against the nulls, not against 0.
+        rows.append(dict(layer=l, true_minus_sib_null=mean(ct) - mean(cs),
+                         true_minus_cross_null=(mean(ct) - mean(cx)) if cx else None,
+                         nearest_cat=mean(near_cat), nearest_top=mean(near_top),
                          nearest_cat_loo_mean=mean(near_loo), cos_true=mean(ct),
                          abs_cos_true=mean(abs(v) for v in ct), cos_sibling_null=mean(cs),
                          cos_cross_null=mean(cx) if cx else None))
@@ -429,6 +433,9 @@ def gate1_conditions(tree, S, L, band, seed):
     topmates = [x["word"] for x in tree.leaves if x["top"] == L["top"] and x["word"] != w]
     conds = {"W0": {}}
     layers = range(band[0], band[1] + 1)
+    bsib = donors(tree, L)[0]
+    conds["B0.5"] = {l: 0.5 * (S[w][l] + S[bsib][l]) for l in layers}   # oak + one sibling, 50/50
+    conds["B1"] = {l: S[bsib][l] for l in layers}                       # the sibling itself
     for tt in TS:
         W, Cp, M, Mt, R, RC, X = {}, {}, {}, {}, {}, {}, {}
         for l in layers:
@@ -458,8 +465,10 @@ def gate2_conditions(tree, S, L, band, pcs, seed):
     d = S[w].shape[1]
     for l in layers:
         h, p1 = S[w][l], S[c["word"]][l]
-        r, rs = h - p1, S[sib][l] - p1
-        U = pcs[l]
+        o, U = pcs[l]                       # shared offset, PCs of centred train residues
+        r, rs = h - p1 - o, S[sib][l] - p1 - o
+        base = p1 + o                       # "a specific leaf of this kind, unspecified"
+        conds.setdefault("K0", {})[l] = base
         for k in KS:
             if k > U.shape[0]:
                 continue
@@ -470,9 +479,9 @@ def gate2_conditions(tree, S, L, band, pcs, seed):
             Q = Q.float().T
             qr = Q.T @ (Q @ r)
             qr = qr * (kr.norm() / qr.norm().clamp_min(1e-12))   # equal size
-            conds.setdefault(f"K{k}", {})[l] = p1 + kr
-            conds.setdefault(f"Q{k}", {})[l] = p1 + qr
-            conds.setdefault(f"T{k}", {})[l] = p1 + Uk.T @ (Uk @ rs)
+            conds.setdefault(f"K{k}", {})[l] = base + kr
+            conds.setdefault(f"Q{k}", {})[l] = base + qr
+            conds.setdefault(f"T{k}", {})[l] = base + Uk.T @ (Uk @ rs)
         conds.setdefault("P", {})[l] = p1
         conds.setdefault("S1bit", {})[l] = p1 + r.norm() * torch.sign(r) / math.sqrt(d)
         conds.setdefault("Tfull", {})[l] = S[sib][l]
@@ -484,8 +493,11 @@ def fit_pcs(tree, S, band):
     train = [L for L in tree.leaves if L["split"] == "train"]
     for l in range(band[0], band[1] + 1):
         R = torch.stack([S[L["word"]][l] - S[tree.cats[L["cat"]]["word"]][l] for L in train])
-        _, _, Vh = torch.linalg.svd(R.double(), full_matrices=False)
-        pcs[l] = Vh.float()
+        o = R.mean(0)
+        # Centred, so PC1 is not the shared "specific leaf vs the word" offset fused with
+        # one train leaf's identity (the smoke run aliased maple -> oak that way).
+        _, _, Vh = torch.linalg.svd((R - o).double(), full_matrices=False)
+        pcs[l] = (o, Vh.float())
     return pcs
 
 
@@ -548,7 +560,8 @@ def run(lm, out_dir, max_leaves=None, log=print):
     for r in report["gate0"]:
         log(f"  {r['layer']:3d}    {r['nearest_cat']:.2f}          {r['nearest_cat_loo_mean']:.2f}"
             f"              {r['nearest_top']:.2f}     {r['cos_true']:+.3f}      "
-            f"{r['cos_sibling_null']:+.3f}         {fmt(r['cos_cross_null'], '+.3f')}")
+            f"{r['cos_sibling_null']:+.3f}         {fmt(r['cos_cross_null'], '+.3f')}"
+            f"        true-null {fmt(r['true_minus_cross_null'], '+.3f')}")
     save()
 
     # ---- Gate C: printed baseline, then the band by transplant on train leaves
@@ -681,6 +694,24 @@ def run(lm, out_dir, max_leaves=None, log=print):
     for v in drift.values():
         v.pop("_dc")
     report["gate1"]["prototype_drift"] = drift
+    bl = []
+    for i, L in enumerate(test):
+        b5, b1, w0 = rows1["B0.5"][i]["margins"], rows1["B1"][i]["margins"], rows1["W0"][i]["margins"]
+        sib = donors(tree, L)[0]
+        c = f"cat:{L['cat']}"
+        bl.append(dict(item=L["word"], sib=sib,
+                       both_rejected=float(b5[f"leaf:{L['word']}"] < 0 and b5[f"leaf:{sib}"] < 0),
+                       cat_overshoot=float(b5[c] > max(w0[c], b1[c])),
+                       d_cat_vs_better_end=b5[c] - max(w0[c], b1[c])))
+    report["gate1"]["sibling_blend"] = dict(
+        rows=bl, both_rejected=mean(x["both_rejected"] for x in bl),
+        cat_overshoot=mean(x["cat_overshoot"] for x in bl),
+        d_cat_vs_better_end=boot([x["d_cat_vs_better_end"] for x in bl]))
+    sb = report["gate1"]["sibling_blend"]
+    log(f"  oak+sibling 50/50 (B0.5): both names rejected {sb['both_rejected']:.2f}, category above "
+        f"both ends {sb['cat_overshoot']:.2f}, category minus better end "
+        f"{sb['d_cat_vs_better_end']['mean']:+.2f} [{sb['d_cat_vs_better_end']['lo']:+.2f},"
+        f"{sb['d_cat_vs_better_end']['hi']:+.2f}]")
     readings["generic_rise_toward_word_parent"] = any(drift[f"W{t:g}"]["generic_rise"] for t in (0.5, 0.75))
     readings["generic_rise_toward_sibling_mean"] = any(drift[f"M{t:g}"]["generic_rise"] for t in (0.5, 0.75))
     log("  prototype drift vs unblurred (yes-minus-no nats; mean [95% CI]):")
@@ -699,6 +730,7 @@ def run(lm, out_dir, max_leaves=None, log=print):
         for name, tg in conds.items():
             target = sib if name.startswith("T") else None
             j = judge(tree, L, lm.margins(L["word"], tree.questions(L), tg), lw=target)
+            j["alias_train"] = float(tree.by[j["picks"][2]]["split"] == "train")
             rows2.setdefault(name, []).append(dict(item=L["word"], sib=sib, **j))
     g2 = {n: mean(r["leaf"] for r in rs) for n, rs in rows2.items()}
     gap = b_test["leaf"] - g2["P"]
@@ -715,10 +747,13 @@ def run(lm, out_dir, max_leaves=None, log=print):
                       one_bit=(rec("S1bit") >= 0.8) if rec("S1bit") is not None else None,
                       transplant_k=next((k for k in ks if g2.get(f"T{k}", 0) >= 0.5), None)))
     log("\nGate 2: blur to 'tree' (P), put back part of the residue; leaf accuracy on test leaves")
-    log(f"  printed {b_test['leaf']:.2f}   P {g2['P']:.2f}   1 bit/dim {g2['S1bit']:.2f}")
+    alias = {n: mean(r["alias_train"] for r in rs) for n, rs in rows2.items()}
+    report["gate2"]["alias_to_train_leaf"] = alias
+    log(f"  printed {b_test['leaf']:.2f}   P {g2['P']:.2f}   1 bit/dim {g2['S1bit']:.2f}   "
+        f"K0 (tree + shared leaf offset) {g2['K0']:.2f}")
     for k in ks:
-        log(f"  k={k:2d}: top-k PCs {g2[f'K{k}']:.2f}   equal-size random {g2[f'Q{k}']:.2f}   "
-            f"sibling's residue -> says sibling {g2[f'T{k}']:.2f}")
+        log(f"  k={k:2d}: top-k PCs {g2[f'K{k}']:.2f} (named a train leaf {alias[f'K{k}']:.2f})   "
+            f"equal-size random {g2[f'Q{k}']:.2f}   sibling's residue -> says sibling {g2[f'T{k}']:.2f}")
     log(f"  sibling full state -> says sibling {g2['Tfull']:.2f}")
     log(f"  readings: {report['gate2']['readings']}")
     report["seconds"] = round(time.time() - t0, 1)
@@ -775,8 +810,9 @@ def self_test():
     test = [x for x in tree.leaves if x["split"] == "test"][0]
     pcs = fit_pcs(tree, S, band)
     g2, sib = gate2_conditions(tree, S, test, band, pcs, 1)
-    p1t = S[tree.cats[test["cat"]]["word"]][l]
+    p1t = S[tree.cats[test["cat"]]["word"]][l] + pcs[l][0]
     assert abs(float((g2["K4"][l] - p1t).norm() - (g2["Q4"][l] - p1t).norm())) < 1e-3
+    assert torch.allclose(g2["K0"][l], p1t)
     assert torch.allclose(g2["Tfull"][l], S[sib][l])
     assert all(tree.by[x["word"]]["split"] == "train" for x in tree.leaves if x["split"] == "train")
     # 6. the whole run, end to end, on a 1-leaf-per-split tree
