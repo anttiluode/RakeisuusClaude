@@ -60,6 +60,11 @@ Fixed readings:
 2. **Selective.** The per-leaf value (cat − leaf) on W, minus the same on R, averaged over t = 0.5 and 0.75, has a bootstrap 95% CI above 0. Then the concept blur removes identity more selectively than an equal-size random move.
 3. **The sum is the parent.** At M1, category ≥ 0.8, leaf ≤ chance + 0.15, and leaf flatness (normalized entropy over the sibling answers) ≥ 0.8. The average of the other trees is then read as "a tree, no particular one." If M1 instead commits to one sibling, averaging is not a blur in Qwen's eyes.
 4. **The direction decides.** At X1, the category answer becomes *flower* for ≥ 0.8 and top stays *plant* for ≥ 0.9.
+5. **Prototype drift (Neon, from Sihti's eye curve).** Margins alone can't tell a category that stayed strong from one that survived only because its rivals fell. So, per test leaf at t = 0.5 and 0.75 on the W, M and R paths, against the unblurred clamp, three quantities are measured:
+   - the change in **absolute** yes-evidence for its own category (and own top);
+   - the change in **leaf specificity**: own-leaf evidence minus the mean of the sibling leaves.
+
+   A **generic rise** is a category-evidence CI above 0 together with a specificity CI below 0, on W or M. It is **concept-specific** if the category gain beats the equal-size random move R (paired CI above 0). This is the Qwen version of Sihti's "these eyes fade while eye-likeness rises". In Sihti, plain diffusion did it too, which is why R is the control here.
 
 **Gate 2, how small is the leaf (test leaves).** Start at P, the state blurred fully to *tree*, and add back part of the residue r = oak − tree.
 

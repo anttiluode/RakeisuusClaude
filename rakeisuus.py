@@ -562,7 +562,9 @@ def run(lm, out_dir, max_leaves=None, log=print):
     rows1 = {}
     for i, L in enumerate(test):
         for name, tg in gate1_conditions(tree, S, L, band, SEED + i).items():
-            j = judge(tree, L, lm.margins(L["word"], tree.questions(L), tg or None))
+            m = lm.margins(L["word"], tree.questions(L), tg or None)
+            j = judge(tree, L, m)
+            j["margins"] = m
             if name.startswith("X"):
                 j["cat_wrong"] = float(j["picks"][1] == tree.cats[L["cat"]]["sib"])
             rows1.setdefault(name, []).append(dict(item=L["word"], **j))
@@ -606,7 +608,46 @@ def run(lm, out_dir, max_leaves=None, log=print):
         extra = f"  chose wrong cat {r['cat_wrong']:.2f}" if "cat_wrong" in r else ""
         log(f"  {n:6s} {r['top']:.2f}  {r['cat']:.2f}  {r['leaf']:.2f}   {r['leaf_H']:.2f}{extra}")
     log(f"  first drop along W then C (index 0-8): {drops}")
-    log(f"  readings: {report['gate1']['readings']}")
+    # Prototype drift (Neon, from Sihti's eye curve): as identity fades, does the
+    # absolute evidence for the item's own category hold or rise, or does the
+    # category only "survive" because its rivals fell too?
+    def ev(row, L):
+        m = row["margins"]
+        own = m[f"leaf:{L['word']}"]
+        rest = [v for k, v in m.items() if k.startswith("leaf:") and k != f"leaf:{L['word']}"]
+        return m[f"cat:{L['cat']}"], m[f"top:{L['top']}"], own - mean(rest)
+    drift = {}
+    for p in ("W", "M", "R"):
+        for t in (0.5, 0.75):
+            dc, dt, ds = [], [], []
+            for i, L in enumerate(test):
+                c0, t0_, s0 = ev(rows1["W0"][i], L)
+                c1, t1, s1 = ev(rows1[f"{p}{t:g}"][i], L)
+                dc.append(c1 - c0)
+                dt.append(t1 - t0_)
+                ds.append(s1 - s0)
+            drift[f"{p}{t:g}"] = dict(d_cat_evidence=boot(dc), d_top_evidence=boot(dt),
+                                      d_leaf_specificity=boot(ds), _dc=dc)
+    readings = report["gate1"]["readings"]
+    for p in ("W", "M"):
+        for t in (0.5, 0.75):
+            k = f"{p}{t:g}"
+            diff = boot([a - b for a, b in zip(drift[k]["_dc"], drift[f"R{t:g}"]["_dc"])])
+            drift[k]["d_cat_vs_random"] = diff
+            drift[k]["generic_rise"] = drift[k]["d_cat_evidence"]["lo"] > 0 and \
+                drift[k]["d_leaf_specificity"]["hi"] < 0
+            drift[k]["concept_specific"] = diff["lo"] > 0
+    for v in drift.values():
+        v.pop("_dc")
+    report["gate1"]["prototype_drift"] = drift
+    readings["generic_rise_toward_word_parent"] = any(drift[f"W{t:g}"]["generic_rise"] for t in (0.5, 0.75))
+    readings["generic_rise_toward_sibling_mean"] = any(drift[f"M{t:g}"]["generic_rise"] for t in (0.5, 0.75))
+    log("  prototype drift vs unblurred (yes-minus-no nats; mean [95% CI]):")
+    for k, v in drift.items():
+        f = lambda b: f"{b['mean']:+.2f} [{b['lo']:+.2f},{b['hi']:+.2f}]"
+        log(f"    {k:5s} own-category {f(v['d_cat_evidence'])}  own-top {f(v['d_top_evidence'])}  "
+            f"leaf specificity {f(v['d_leaf_specificity'])}")
+    log(f"  readings: {readings}")
     save()
 
     # ---- Gate 2
