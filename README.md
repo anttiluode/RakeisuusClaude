@@ -117,6 +117,20 @@ python3.13 rakeisuus.py --device cuda
 - Not about weights. Nothing is trained or quantized. The grain is in the activations.
 - Not a claim about brains. The ephaptic field is the picture that suggested "sum forgets which," not something tested here.
 
+## Smoke run, Qwen3-1.7B (Nov 24, one leaf per category per split)
+
+[`runs/Qwen_Qwen3-1.7B_smoke1/summary.json`](runs/Qwen_Qwen3-1.7B_smoke1/summary.json): 16 leaves, 8 test, 2 leaves per category. It is a plumbing check, not the experiment. With two leaves per category the leaf question is a 2-way choice, the "mean of the other trees" is one tree, and the Gate 2 sibling is a train leaf whose residue is inside the PC basis. So the M path, the sum-is-parent reading and the Gate 2 transplant are not meaningful here.
+
+- **Tokens.** Qwen3 splits 14 candidate words. The flower category is dropped (2 single-token leaves), so a category's wrong parent is the next category of the same kind (tree → vegetable).
+- **Gate 0.** The tree is in the geometry: nearest category word ≥ 0.94 at almost every layer, embedding included. It is not Park-like: cos(oak − tree, tree − plant) is about −0.3, only about 0.1 above both nulls, never near 0.
+- **Gate C.** Every band transplants perfectly, including L4–12, which leaves layers 0–3 unclamped. GrainLensSol V2's item-only swap at layer 14 moved 0/8. So the word is copied out of its own position somewhere between layer 4 and layer 14; the report-only window below locates it.
+- **Gate 1, the clean part.** Blurring toward the category word lowers leaf specificity by 23 nats at t = 0.5 and 39 at t = 0.75. Evidence for the item's own category does not fall (+2.0, CI −2.4..+8.1). The equal-size random move does the opposite: category evidence falls (−3.5, CI −7.1..−0.6) while specificity barely moves (−1.7, CI −3.9..+0.5). The wrong-parent blur works as fixed: the category answer becomes the sibling category (1.00 at t = 0.75) while the top answer stays (1.00).
+- **An artifact the smoke exposed.** At X1 the slot holds a wrong category word and no leaf information, yet the leaf question still picked the test leaf 8/8. With no information the model prefers some names. That would fake leaf survival.
+
+**Changes after the smoke run (thresholds unchanged):**
+- Every choice is now made on evidence minus the evidence for a neutral slot, `Item: thing`, with raw choices kept beside them.
+- A report-only layer window (clamps starting at layers 4…20, without the embedding) locates where the word stops mattering at its own position.
+
 ## Neon's audit of GrainLensSol, applied here
 
 - **Lens built from category words.** Not applicable: no lens is used. Targets are Qwen's own states for each word.

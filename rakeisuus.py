@@ -41,6 +41,14 @@ SEED = 20261124
 # Qwenimagination V9: concept swaps steer only when the band covers layers 4-12.
 BANDS28 = [(-1, 12), (-1, 8), (0, 12), (2, 12), (4, 12), (4, 16)]
 TS = (0.25, 0.5, 0.75, 1.0)
+# Neutral slot for calibration: with no item information the model still prefers
+# some option names (smoke run, Nov 24: under the wrong-category clamp X1 the leaf
+# question picked the test leaf 8/8). Every choice is made on evidence minus the
+# evidence for "Item: thing"; raw choices are kept beside them.
+NEUTRAL = ["thing", "something", "stuff"]
+# Report-only locator: clamp starting at these layers (no embedding), 8 layers long,
+# to find where the word stops mattering at its own position.
+LOCATOR28 = (4, 6, 8, 10, 12, 14, 16, 20)
 KS = (1, 2, 4, 8, 16)
 
 
@@ -293,8 +301,14 @@ class Tree:
 
 
 def judge(tree, leaf, m, top=None, cat=None, lw=None):
-    """Which option wins at each level, scored against the given targets."""
-    def pick(prefix):
+    """Which option wins at each level, scored against the given targets.
+    Choices use evidence minus the neutral slot's evidence when tree.cal is set."""
+    raw = m
+    cal = getattr(tree, "cal", {}).get(leaf["cat"])
+    if cal:
+        m = {k: v - cal[k] for k, v in m.items()}
+
+    def pick(prefix, m=m):
         opts = {k.split(":", 1)[1]: v for k, v in m.items() if k.startswith(prefix)}
         return max(opts, key=opts.get), opts
     t, _ = pick("top:")
@@ -303,8 +317,13 @@ def judge(tree, leaf, m, top=None, cat=None, lw=None):
     z = torch.tensor(list(lo.values()))
     p = torch.softmax(z, 0)
     H = float(-(p * p.clamp_min(1e-12).log()).sum() / math.log(len(lo)))
+    tr, _ = pick("top:", raw)
+    cr, _ = pick("cat:", raw)
+    lr, _ = pick("leaf:", raw)
     return dict(top=float(t == (top or leaf["top"])), cat=float(c == (cat or leaf["cat"])),
-                leaf=float(l == (lw or leaf["word"])), leaf_H=H, picks=[t, c, l])
+                leaf=float(l == (lw or leaf["word"])), leaf_H=H, picks=[t, c, l],
+                raw=dict(top=float(tr == (top or leaf["top"])), cat=float(cr == (cat or leaf["cat"])),
+                         leaf=float(lr == (lw or leaf["word"])), picks=[tr, cr, lr]))
 
 
 def boot(xs, n=2000, seed=SEED):
@@ -502,6 +521,18 @@ def run(lm, out_dir, max_leaves=None, log=print):
         f"multi-token words")
 
     S = {w: lm.states(w) for w in tree.words()}
+    neutral = next((w for w in NEUTRAL if lm.prompt(w, C.TOPS[0][1])[1] is not None), None)
+    tree.cal = {}
+    if neutral:
+        for k, c in tree.cats.items():
+            tree.cal[k] = lm.margins(neutral, tree.questions(tree.by[c["leaves"][0]]))
+    report["neutral_slot"] = neutral
+    report["neutral_choices"] = {k: dict(
+        top=max((x for x in m if x.startswith("top:")), key=m.get),
+        cat=max((x for x in m if x.startswith("cat:")), key=m.get),
+        leaf=max((x for x in m if x.startswith("leaf:")), key=m.get)) for k, m in tree.cal.items()}
+    log(f"calibration slot: 'Item: {neutral}'; what an empty slot gets called, per category: "
+        f"{ {k: v['leaf'][5:] for k, v in report['neutral_choices'].items()} }")
 
     def save():
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -556,6 +587,14 @@ def run(lm, out_dir, max_leaves=None, log=print):
     log(f"  chosen {key}; on test leaves: sibling leaf {tt['sibling_leaf']:.2f}  "
         f"cross cat {fmt(tt['cross_cat'])}  cross top {fmt(tt['cross_top'])}"
         f"  -> leaf-level readable: {'yes' if tt['sibling_leaf'] >= 0.5 else 'NO'}")
+    # report-only: where does the word stop mattering at its own position?
+    window = {}
+    for s0 in sorted({round(x * lm.n_layers / 28) for x in LOCATOR28}):
+        b = (s0, min(lm.n_layers - 1, s0 + round(8 * lm.n_layers / 28)))
+        window[f"L{b[0]}-{b[1]}"] = w = transplant(lm, tree, S, test, b)
+        log(f"  window L{b[0]}-{b[1]} (no embedding), test: sibling leaf {w['sibling_leaf']:.2f}  "
+            f"cross cat {fmt(w['cross_cat'])}  cross top {fmt(w['cross_top'])}")
+    report["gateC"]["window"] = window
     save()
 
     # ---- Gate 1
@@ -601,12 +640,14 @@ def run(lm, out_dir, max_leaves=None, log=print):
             sum_is_parent=m1["cat"] >= 0.8 and m1["leaf"] <= chance["leaf"] + 0.15 and m1["leaf_H"] >= 0.8,
             wrong_parent_decides=x1["cat_wrong"] >= 0.8 and x1["top"] >= 0.9))
     log("\nGate 1: accuracy on test leaves (W oak->'tree', C 'tree'->'plant', M oak->mean of other "
-        "trees, MT mean trees->mean plants, R/RC same-size random, X oak->'flower')")
-    log("  cond    top   cat   leaf  leaf-flatness")
+        "trees, MT mean trees->mean plants, R/RC same-size random, X oak->a sibling category word)")
+    log("  cond    top   cat   leaf  leaf-flatness   (uncalibrated: top cat leaf)")
     for n in ["W0"] + [f"{p}{t:g}" for p in ("W", "C", "M", "MT", "R", "RC", "X") for t in TS]:
         r = g1[n]
+        rw = {k: mean(x["raw"][k] for x in rows1[n]) for k in ("top", "cat", "leaf")}
         extra = f"  chose wrong cat {r['cat_wrong']:.2f}" if "cat_wrong" in r else ""
-        log(f"  {n:6s} {r['top']:.2f}  {r['cat']:.2f}  {r['leaf']:.2f}   {r['leaf_H']:.2f}{extra}")
+        log(f"  {n:6s} {r['top']:.2f}  {r['cat']:.2f}  {r['leaf']:.2f}   {r['leaf_H']:.2f}"
+            f"            ({rw['top']:.2f} {rw['cat']:.2f} {rw['leaf']:.2f}){extra}")
     log(f"  first drop along W then C (index 0-8): {drops}")
     # Prototype drift (Neon, from Sihti's eye curve): as identity fades, does the
     # absolute evidence for the item's own category hold or rise, or does the
