@@ -2,6 +2,8 @@
 
 *Rakeisuus* is Finnish for graininess. The question: when a model holds the word *oak*, what can that state afford to forget, and in what order?
 
+[Research note: When maple fades and tree gets louder](HIERARCHICAL_GEOMETRY.md) compares the 22-item intervention with Karkada et al.’s symmetry paper and explains which part of the effect follows from averaging alone.
+
 Sibling repo: [GrainLensSol](https://github.com/anttiluode/GrainLensSol) asks how much can be removed before a computation fails, using generic coarsening (PCA, precision, random projections). This repo blurs along the model's **own concept tree**:
 
 ```
