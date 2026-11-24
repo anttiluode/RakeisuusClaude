@@ -118,6 +118,40 @@ python3.13 rakeisuus.py --device cuda
 - Not about weights. Nothing is trained or quantized. The grain is in the activations.
 - Not a claim about brains. The ephaptic field is the picture that suggested "sum forgets which," not something tested here.
 
+## Calibrated full run, Qwen3-1.7B (Nov 24, 46 leaves, 22 test): results
+
+[`runs/Qwen_Qwen3-1.7B/summary.json`](runs/Qwen_Qwen3-1.7B/summary.json), current code: neutral-slot calibration, centred Gate 2, sibling blend, layer window, Gate 3.
+
+**What holds:**
+1. **The sibling average peels off the individual and strengthens the kind.** At ¾ of the way toward the mean of the other leaves:
+   - all 22 held-out leaves gain evidence for their own category, and all 22 lose identity evidence;
+   - the equal-size random move raises category evidence for 0 of 22;
+   - means: category +3.92 [+2.41, +5.92], top +2.33 [+1.14, +3.93], leaf specificity −40.3;
+   - moving toward the category *word* does not raise the category (−0.58 [−3.28, +3.03]);
+   - the fixed "generic rise" reading holds.
+
+   Caveat: the category word placed as the item ("Item: vegetable. Is the item above a vegetable?") is an odd, self-referential prompt, which may be part of why the word path is weaker.
+2. **Two siblings are already enough, often.** Oak blended 50/50 with one sibling: both names are rejected for 73% of leaves, and category evidence lands above both ends for 77%. Mean gain over the better end is +1.10 [+0.27, +2.18].
+3. **It is not RMSNorm gain** (Gate 3). The category rise from one leaf to the whole category's average is +3.41 [+0.89, +7.82] raw and +3.36 [+0.83, +7.76] with the average rescaled to the members' norm, so matching the norm changes nothing. Neon's mechanism is ruled out for this rise.
+4. **The average names its kind when nothing in the prompt does.** Averaging 3 or more leaves gets a "no" to every member's own name in all 8 categories. Asked "What kind of thing is the item above? Answer with one word.", the same averaged state answers with its category 8/8. Top tokens include ' tree', ' vegetable', ' bird', ' insect', ' tool', ' vehicle', ' instrument'; for fish, ' animal' comes first, ' fish' second. A single leaf already does this (8/8), so this shows the averaged state keeps the kind while losing every name; it does not show sharpening.
+5. **Order of forgetting** leaf → category → top, and **selectivity over random** +0.48 [+0.32, +0.66]: hold.
+6. **Where the word lives.** The report-only window clamps from a start layer, without the embedding. Sibling-leaf transplant goes 0.77 (from L4), 0.55 (L6), 0.59 (L8), 0.27 (L10), then 0.00 from L12 on; category and top follow. Qwen reads the concept out of its own token between about layer 8 and 12. After that, overwriting the token changes nothing. This is why GrainLensSol V1's item-only edit at layer 14 moved 0/8, and it matches Qwenimagination V9 (bands starting at 12 or later did nothing).
+7. **Identity is owned, not shared** (Gate 2, centred). Blurred to *tree*, leaf accuracy is 0.23.
+   - The **sign of the leaf's own residue**, one bit per dimension, brings it back to 0.82. That is 76% of the gap, just under the fixed 80% bar.
+   - Directions learned from *other* leaves bring back nothing (≤ 0.14 at every *k*), and name a train leaf 64–77% of the time.
+   - A sibling's residue on those directions does not carry the sibling (≤ 0.18); its full state does (1.00).
+   - The category lives in a shared core; each leaf's identity is its own high-dimensional direction. This is the GraphNN lesson (shared bytes for gist, owned bytes for items) inside a trained model.
+
+**What fails or can't be read:**
+- *Sum is parent* fails on flatness (0.46 < 0.8). The sibling mean rejects every name in absolute terms, but relative to each other the names are not flat.
+- *The direction decides* now fails narrowly: the category flips 1.00, but the top stays only 0.86 < 0.9 under calibration.
+- *Small residue* and *one bit* both fail their bars; one bit misses by 4 points.
+- Gate 3 is at ceiling. Calibrated category evidence is +30 to +45 nats already for one leaf, so "sharpening with more siblings" mostly cannot show; the overall rise is carried by insect (ant alone reads weakly as an insect) and vehicle.
+- One intruder in 7 does nothing (category +0.29 [−0.05, +0.59]). To find the boundary, sweep the intruder's share.
+- "Members rejected" uses a raw "no". For tree and insect even the single leaf gets a raw "no" to its own name, so that column is crude for those two.
+
+**Not new:** a category as the mean of its exemplars is prototype theory, and averaging embeddings is concept arithmetic. What this repo adds is the measured contrast inside a frozen model: sibling mean raises the kind, the category word doesn't, and equal random damage lowers it. It adds the identity-is-owned result and the layer window.
+
 ## Gate 3 (report-only, added after the full run below): what does averaging siblings make?
 
 Per category, the first *n* leaves (n = 1…6) are averaged and clamped (embedding to the band's end) into an empty slot, `Item: thing`. Then:
