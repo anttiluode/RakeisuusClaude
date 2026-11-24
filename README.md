@@ -118,6 +118,47 @@ python3.13 rakeisuus.py --device cuda
 - Not about weights. Nothing is trained or quantized. The grain is in the activations.
 - Not a claim about brains. The ephaptic field is the picture that suggested "sum forgets which," not something tested here.
 
+## Gate 3 (report-only, added after the full run below): what does averaging siblings make?
+
+Per category, the first *n* leaves (n = 1…6) are averaged and clamped (embedding to the band's end) into an empty slot, `Item: thing`. Then:
+
+- **Category evidence**, calibrated against the empty slot.
+- **Members rejected:** the fraction of averaged leaves whose own-name question gets a "no".
+- **Open readout:** "What kind of thing is the item above? Answer with one word." Nothing in the prompt names a category. It reports which category word's first token gains most over the empty slot, plus the raw top-5 tokens.
+- **N*n*:** the same mean rescaled to the members' average norm per layer. This is Neon's RMSNorm explanation: averaging shortens the vector and normalization makes the shared part louder. If the rise vanishes under norm matching, it was gain.
+- **Intruder:** all leaves plus the first leaf of the sibling category (same top, e.g. a tool among instruments). Expected: category falls, top stays.
+
+Summaries are over categories (8 values, so the CIs are wide): the rise from n = 1 to all, raw and norm-matched; the intruder's effect on category and on top; and how often the open question names the right category for one leaf, for all leaves, and for all leaves norm-matched.
+
+## Full run, Qwen3-1.7B (Nov 24, 46 leaves, 22 test), before the calibration fix
+
+[`runs/Qwen_Qwen3-1.7B/summary.json`](runs/Qwen_Qwen3-1.7B/summary.json). This run used the code from before the neutral-slot calibration, the centred Gate 2 and the sibling blend. Readings built on differences between conditions are unaffected; readings that use raw leaf choices are not usable.
+
+- **Not usable from this run:** leaf accuracy at W1, X1, C*t* and M1. Every leaf in a category gets the identical clamp at W1 and X1, so each category always gets the same default name, and accuracy just counts how often that name is right. Gate 2 used the uncentred PCs.
+- **Gate 0.** Nearest category word ≥ 0.93 from layer 4 on. Nearest top word is weak in the middle layers (0.50–0.63) and rises late (0.78–0.85 at 21–26). cos(true) sits about +0.10 above both nulls at every layer: hierarchical structure, but not orthogonal.
+- **Gate C.** Bands from the embedding transplant perfectly (sibling leaf 1.00). Starting at layer 2 or 4 drops it to 0.88 and 0.83, so some of the word is copied out of its slot in layers 0–3.
+- **Gate 1, fixed readings:**
+  - *Order* leaf → category → top: **holds**. Leaf falls at W0.75, category at C0.75, top never falls below threshold.
+  - *Selective* vs random: **holds**, +0.39 [+0.18, +0.61].
+  - *The direction decides*: **holds**. The wrong parent flips the category 1.00 while top stays 1.00.
+  - *Sum is parent*: **fails** on leaf flatness (0.48 < 0.8), and its leaf picks are uncalibrated.
+- **Prototype drift, 22 held-out leaves, unaffected by calibration.** This is the clearest result. Changes in yes-minus-no nats against the unblurred clamp:
+
+  | | own category | own top | leaf specificity |
+  |---|---|---|---|
+  | toward the mean of the other leaves, t = 0.5 | **+3.19 [+1.99, +4.79]** | **+1.99 [+0.97, +3.37]** | −7.6 |
+  | same, t = 0.75 | **+3.92 [+2.41, +5.92]** | **+2.33 [+1.14, +3.93]** | −40.3 |
+  | toward the word *tree*, t = 0.5 | +0.29 [−1.69, +3.03] | +1.39 | −17.4 |
+  | toward the word *tree*, t = 0.75 | −0.58 [−3.28, +3.03] | +0.95 | −37.4 |
+  | equal-size random move, t = 0.5 | −3.41 [−5.48, −1.79] | −1.82 | −0.6 |
+  | equal-size random move, t = 0.75 | −6.61 [−8.95, −4.52] | −4.01 | −10.7 |
+
+  - Moving a leaf toward the average of its siblings removes its identity and **raises** the evidence for its category and its top kind, with both CIs above zero. Against the random move the category gain is +6.6 [+3.9, +9.9] at t = 0.5 and +10.5 [+7.4, +14.2] at t = 0.75.
+  - Moving toward the category *word* removes identity but only holds the category level.
+  - Random damage removes the category first.
+  - This is the fixed "generic rise" reading, Sihti's eye curve (these eyes fade, eye-likeness rises), on held-out leaves of a frozen language model. Caveats: the category question names the category, and averaging can be read as concept arithmetic, which is known. Gate 3 adds the open readout and the norm-matched arm.
+- **Gate 2 (uncentred, superseded).** Blurring to *tree* drops the leaf from 1.00 to 0.32. One bit per dimension brings it to 0.59 (40% of the gap, below the 80% bar). Top-*k* PCs do worse than random, which was the aliasing. A sibling's PC residue does not carry its identity (≤ 0.36), though its full state does (1.00).
+
 ## Smoke run, Qwen3-1.7B (Nov 24, one leaf per category per split)
 
 [`runs/Qwen_Qwen3-1.7B_smoke1/summary.json`](runs/Qwen_Qwen3-1.7B_smoke1/summary.json): 16 leaves, 8 test, 2 leaves per category. It is a plumbing check, not the experiment. With two leaves per category the leaf question is a 2-way choice, the "mean of the other trees" is one tree, and the Gate 2 sibling is a train leaf whose residue is inside the PC basis. So the M path, the sum-is-parent reading and the Gate 2 transplant are not meaningful here.

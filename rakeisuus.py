@@ -32,6 +32,9 @@ MODEL = "Qwen/Qwen3-1.7B"     # GrainLensSol's checkpoint, so the two repos can 
 YES, NO = ["Yes", "yes"], ["No", "no"]
 USER = "Item: {w}\n\n{q} Answer yes or no."
 PREFIX = "Answer:"
+# Gate 3's open-ended readout never names a category in the prompt.
+OPEN_USER = "Item: {w}\n\n{q}"
+OPEN_Q = "What kind of thing is the item above? Answer with one word."
 SEED = 20261124
 # Candidate bands for a 28-layer model, inclusive, scaled for other depths.
 # Layer -1 is the token embedding (the input to layer 0). A band starting at -1
@@ -119,9 +122,9 @@ class Lm:
             t = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         return t + PREFIX
 
-    def prompt(self, word, q):
+    def prompt(self, word, q, template=USER):
         """Token ids, and the word's position if the word is exactly one token there."""
-        text = self.chat_text(USER.format(w=word, q=q))
+        text = self.chat_text(template.format(w=word, q=q))
         ws = text.index("Item: " + word) + len("Item: ")
         we = ws + len(word)
         enc = self.tok(text, add_special_tokens=False, return_offsets_mapping=True)
@@ -161,6 +164,19 @@ class Lm:
             x[b, :len(ids)] = torch.tensor(ids)
             mask[b, :len(ids)] = 1
         last = mask.sum(1) - 1
+        hooks = self._clamp_hooks(pos, targets)
+        try:
+            hs = self.model.model(input_ids=x.to(self.device),
+                                  attention_mask=mask.to(self.device)).last_hidden_state
+        finally:
+            for h in hooks:
+                h.remove()
+        h_last = hs[torch.arange(len(encs), device=hs.device), last.to(hs.device)]
+        lp = torch.log_softmax(self.model.lm_head(h_last).float(), -1)
+        m = torch.logsumexp(lp[:, self.yes], -1) - torch.logsumexp(lp[:, self.no], -1)
+        return {k: float(v) for (k, _), v in zip(questions, m.cpu())}
+
+    def _clamp_hooks(self, pos, targets):
         hooks = []
         for l, v in (targets or {}).items():
             if l == -1:
@@ -173,16 +189,28 @@ class Lm:
                 h[:, pos] = v.to(h.device, h.dtype)
                 return _replace(out, h)
             hooks.append(self.layers[l].register_forward_hook(hook))
+        return hooks
+
+    @torch.no_grad()
+    def open_logprobs(self, word, targets=None):
+        """Next-token log-probs after an open question that names no category."""
+        ids, pos = self.prompt(word, OPEN_Q, template=OPEN_USER)
+        hooks = self._clamp_hooks(pos, targets)
         try:
-            hs = self.model.model(input_ids=x.to(self.device),
-                                  attention_mask=mask.to(self.device)).last_hidden_state
+            hs = self.model.model(input_ids=torch.tensor([ids], device=self.device)).last_hidden_state
         finally:
             for h in hooks:
                 h.remove()
-        h_last = hs[torch.arange(len(encs), device=hs.device), last.to(hs.device)]
-        lp = torch.log_softmax(self.model.lm_head(h_last).float(), -1)
-        m = torch.logsumexp(lp[:, self.yes], -1) - torch.logsumexp(lp[:, self.no], -1)
-        return {k: float(v) for (k, _), v in zip(questions, m.cpu())}
+        return torch.log_softmax(self.model.lm_head(hs[0, -1]).float(), -1).cpu()
+
+    def word_ids(self, word):
+        out = set()
+        for w in {word, word.capitalize()}:
+            for s_ in (" " + w, w):
+                ids = self.tok(s_, add_special_tokens=False)["input_ids"]
+                if len(ids) == 1:
+                    out.add(ids[0])
+        return sorted(out)
 
 
 def load_hf(name, device, dtype):
@@ -220,6 +248,9 @@ class StubTokenizer:
             out["offset_mapping"] = [m.span() for m in ms]
         return out
 
+    def decode(self, ids):
+        return "".join(self.vocab[i] for i in ids)
+
     def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, **kw):
         s = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in msgs)
         return s + ("<|im_start|>assistant\n" if add_generation_prompt else "")
@@ -227,7 +258,8 @@ class StubTokenizer:
 
 def load_stub(device="cpu", layers=8, d=64, seed=0):
     from transformers import Qwen2Config, Qwen2ForCausalLM
-    texts = C.all_words() + C.all_questions() + [USER, PREFIX, "user assistant"] + YES + NO
+    texts = C.all_words() + C.all_questions() + [USER, PREFIX, "user assistant", OPEN_Q] + \
+        YES + NO + NEUTRAL + [w.capitalize() for w in C.all_words()]
     tok = StubTokenizer(texts)
     torch.manual_seed(seed)
     cfg = Qwen2Config(vocab_size=len(tok.vocab), hidden_size=d, intermediate_size=2 * d,
@@ -756,6 +788,83 @@ def run(lm, out_dir, max_leaves=None, log=print):
             f"equal-size random {g2[f'Q{k}']:.2f}   sibling's residue -> says sibling {g2[f'T{k}']:.2f}")
     log(f"  sibling full state -> says sibling {g2['Tfull']:.2f}")
     log(f"  readings: {report['gate2']['readings']}")
+
+    # ---- Gate 3 (report-only): what does averaging siblings make?
+    # Neon/Sol, after the smoke run: does the category sharpen as more siblings are
+    # averaged, is the rise just RMSNorm gain on a shorter vector (norm-matched arm),
+    # does an open question that never names the category produce it, and what
+    # does an intruder from the sibling category do?
+    neu = report.get("neutral_slot") or tree.cats[next(iter(tree.cats))]["leaves"][0]
+    cat_ids = {k: lm.word_ids(c["word"]) for k, c in tree.cats.items()}
+    open_neu = lm.open_logprobs(neu)
+
+    def open_read(lp):
+        sc = {k: float(torch.logsumexp(lp[ids], 0) - torch.logsumexp(open_neu[ids], 0))
+              for k, ids in cat_ids.items() if ids}
+        top5 = [lm.tok.decode([int(i)]) for i in lp.topk(5).indices]
+        return sc, top5
+
+    def matched(vecs, members):
+        out = {}
+        for l, v in vecs.items():
+            n = mean(float(S[w][l].norm()) for w in members)
+            out[l] = v * (n / float(v.norm()))
+        return out
+    rows3 = {}
+    lay = range(band[0], band[1] + 1)
+    for k, c in tree.cats.items():
+        leaves = c["leaves"]
+        qs = tree.questions(tree.by[leaves[0]])
+        cal = tree.cal.get(k) if getattr(tree, "cal", None) else None
+        intr = tree.cats[c["sib"]]["leaves"][0]
+        states = {}
+        for n in range(1, len(leaves) + 1):
+            A = {l: torch.stack([S[w][l] for w in leaves[:n]]).mean(0) for l in lay}
+            states[f"A{n}"] = (A, leaves[:n])
+            states[f"N{n}"] = (matched(A, leaves[:n]), leaves[:n])
+        I = {l: torch.stack([S[w][l] for w in leaves + [intr]]).mean(0) for l in lay}
+        states["I"] = (I, leaves + [intr])
+        states["IN"] = (matched(I, leaves + [intr]), leaves + [intr])
+        for name, (tg, members) in states.items():
+            m = lm.margins(neu, qs, tg)
+            mc = {q: v - (cal[q] if cal else 0.0) for q, v in m.items()}
+            sc, top5 = open_read(lm.open_logprobs(neu, tg))
+            others = [v for q, v in mc.items() if q.startswith("cat:") and q != f"cat:{k}"]
+            rows3.setdefault(k, {})[name] = dict(
+                members=members,
+                cat=mc[f"cat:{k}"], top=mc[f"top:{c['top']}"], cat_lead=mc[f"cat:{k}"] - max(others),
+                members_rejected=mean(float(m[f"leaf:{w}"] < 0) for w in members if f"leaf:{w}" in m),
+                open_choice=max(sc, key=sc.get), open_own=sc.get(k), top5=top5)
+    nmax = {k: len(c["leaves"]) for k, c in tree.cats.items()}
+
+    def across(fn):
+        return boot([fn(k) for k in rows3])
+    g3 = dict(
+        rows=rows3,
+        rise_all_vs_one=across(lambda k: rows3[k][f"A{nmax[k]}"]["cat"] - rows3[k]["A1"]["cat"]),
+        rise_all_vs_one_norm_matched=across(lambda k: rows3[k][f"N{nmax[k]}"]["cat"] - rows3[k]["N1"]["cat"]),
+        intruder_cat=across(lambda k: rows3[k]["I"]["cat"] - rows3[k][f"A{nmax[k]}"]["cat"]),
+        intruder_top=across(lambda k: rows3[k]["I"]["top"] - rows3[k][f"A{nmax[k]}"]["top"]),
+        open_right_one=mean(float(rows3[k]["A1"]["open_choice"] == k) for k in rows3),
+        open_right_all=mean(float(rows3[k][f"A{nmax[k]}"]["open_choice"] == k) for k in rows3),
+        open_right_all_norm_matched=mean(float(rows3[k][f"N{nmax[k]}"]["open_choice"] == k) for k in rows3))
+    report["gate3"] = g3
+    log("\nGate 3 (report-only): average the first n leaves of each category into an empty slot "
+        f"('Item: {neu}'); calibrated evidence, N = same mean rescaled to the members' norm")
+    for k, rr in rows3.items():
+        line = "  ".join(f"n{n}: cat {rr[f'A{n}']['cat']:+.1f}/{rr[f'N{n}']['cat']:+.1f} "
+                         f"rej {rr[f'A{n}']['members_rejected']:.2f} -> {rr[f'A{n}']['open_choice']}"
+                         for n in range(1, nmax[k] + 1))
+        log(f"  {k:10s} {line}")
+        log(f"  {'':10s} +intruder {tree.cats[tree.cats[k]['sib']]['leaves'][0]}: cat {rr['I']['cat']:+.1f} "
+            f"top {rr['I']['top']:+.1f} -> {rr['I']['open_choice']}   open top-5 at n={nmax[k]}: "
+            f"{rr[f'A{nmax[k]}']['top5']}")
+    f = lambda b: f"{b['mean']:+.2f} [{b['lo']:+.2f},{b['hi']:+.2f}]"
+    log(f"  category rise, all vs one: {f(g3['rise_all_vs_one'])}; norm-matched: "
+        f"{f(g3['rise_all_vs_one_norm_matched'])}")
+    log(f"  intruder: category {f(g3['intruder_cat'])}, top {f(g3['intruder_top'])}")
+    log(f"  open question names the right category: one leaf {g3['open_right_one']:.2f}, "
+        f"all leaves {g3['open_right_all']:.2f}, all leaves norm-matched {g3['open_right_all_norm_matched']:.2f}")
     report["seconds"] = round(time.time() - t0, 1)
     save()
     return report
