@@ -20,10 +20,10 @@ Sibling repo: [GrainLensSol](https://github.com/anttiluode/GrainLensSol) asks ho
 
 ## Method
 
-- **Model:** `Qwen/Qwen2.5-1.5B-Instruct`, frozen, the [Qwenimagination](https://github.com/anttiluode/Qwenimagination) checkpoint. Its V9 run found that concept swaps steer Qwen only when clamped across a band that includes layers 4–12, and that single-layer additions don't. So this repo clamps across a band from the start.
+- **Model:** `Qwen/Qwen3-1.7B`, frozen. This is GrainLensSol's checkpoint, so the two repos can be joined. `--model Qwen/Qwen2.5-1.5B-Instruct` runs the [Qwenimagination](https://github.com/anttiluode/Qwenimagination) checkpoint instead. Its V9 run found that concept swaps steer only when clamped across a band including layers 4–12, and that single-layer additions don't, so this repo clamps across a band from the start.
 - **Prompt:** chat turn `Item: {word}` then `{question} Answer yes or no.`, assistant prefix `Answer:`. The score is log P(yes) − log P(no).
 - **Questions at three levels:** 3 top questions ("a plant?", "an animal?", "made by people?"), 9 category questions, and one question per leaf in the item's own category. At each level the option with the highest yes-evidence is the model's choice. This cancels any general lean toward yes. Chance is 1/3, 1/9 and 1/6.
-- **Clamp:** every word is a single token. At each layer in the band, the word's position is overwritten with a target state, and nothing else is touched. Targets are built per layer from clean states of the same prompt with a different word, so *tree* is literally Qwen's state for `Item: tree` at that layer.
+- **Clamp:** every word is a single token. At each layer in the band, the word's position is overwritten with a target state, and nothing else is touched. Layer −1 is the token embedding. A band starting there leaves no copy of the original word anywhere in the forward pass, so later tokens cannot route around the clamp. The self-test proves this: clamping *birch* over *oak* from the embedding through every layer gives exactly the answers of the prompt that says *birch*. Targets are built per layer from clean states of the same prompt with a different word, so *tree* is literally Qwen's state for `Item: tree` at that layer.
 - **Tree:** 9 categories, 6 leaves each ([concepts.py](concepts.py)). Words that are not one token are dropped and listed. Leaves alternate train/test within each category. The band and the PCs are chosen on train leaves, and everything reported is on test leaves.
 
 ## Gates
@@ -40,8 +40,9 @@ Fixed readings:
 
 **Gate C, calibration.**
 - *Printed word:* the unclamped prompt must answer all three levels; the fixed bar is top ≥ 0.9, cat ≥ 0.8, leaf ≥ 0.8. If it fails, the questions don't work and nothing below means much.
-- *Band:* five candidate bands (L0–12, L2–12, L4–12, L0–8, L4–16), chosen on train leaves by **transplant**. Clamp a sibling's state (birch into oak's slot) and check whether the leaf answer becomes birch. Clamp a leaf from another top and check whether the category and top answers follow.
-- *Leaf level is readable* if the test-leaf sibling transplant is ≥ 0.5. If not, layers below the band leak the printed word, and leaf-level readings below are void. Category and top readings still stand.
+- *Band:* six candidate bands (L−1–12, L−1–8, L0–12, L2–12, L4–12, L4–16), chosen on train leaves by **transplant**. Clamp a sibling's state (birch into oak's slot) and check whether the leaf answer becomes birch. Clamp a leaf from another top and check whether the category and top answers follow.
+- *Leak:* L−1–12 against L0–12 measures how much the original word gets around a clamp that leaves only the embedding untouched. It is reported, not used to choose.
+- *Leaf level is readable* if the test-leaf sibling transplant is ≥ 0.5. If not, leaf-level readings below are void. Category and top readings still stand.
 
 **Gate 1, the grain ladder (test leaves).** Each path has four steps, t = 0.25, 0.5, 0.75, 1.
 
@@ -89,13 +90,14 @@ python3.13 rakeisuus.py --device cuda
 
 - The `--max-leaves 1` line is a quick look (one leaf per category per split) and writes to its own folder.
 - The full run reads 54 leaves, about 1,700 batched forward passes; expect minutes, not hours.
-- It prints every gate as it goes and writes `runs/Qwen_Qwen2.5-1.5B-Instruct/summary.json` after each gate. Upload that file and paste the printed output.
-- The model downloads from Hugging Face on first run, or comes from your cache if Qwenimagination already pulled it.
+- It prints every gate as it goes and writes `runs/Qwen_Qwen3-1.7B/summary.json` after each gate. Upload that file and paste the printed output.
+- The model comes from your Hugging Face cache, since GrainLensSol already downloaded it.
 
 ## Status
 
 - **No results yet.** The self-test passes on a tiny random Qwen-shaped model. It checks plumbing only:
   - clamping a word to its own state changes nothing;
+  - clamping another word from the embedding through every layer equals that word's own prompt (no bypass);
   - a foreign clamp moves later positions but no earlier ones;
   - padding is harmless;
   - W1 is the parent word and M1 excludes the item itself;
@@ -109,6 +111,13 @@ python3.13 rakeisuus.py --device cuda
 - Not a new interpretability method. Clamping states at a token is activation patching. Concept geometry in LLMs has been studied (Park et al., 2024, on categorical and hierarchical concepts). This is one specific measurement, the order of forgetting along the model's own tree, with controls.
 - Not about weights. Nothing is trained or quantized. The grain is in the activations.
 - Not a claim about brains. The ephaptic field is the picture that suggested "sum forgets which," not something tested here.
+
+## Neon's audit of GrainLensSol, applied here
+
+- **Lens built from category words.** Not applicable: no lens is used. Targets are Qwen's own states for each word.
+- **Bypass around a single-layer cut.** Applied: bands can start at the embedding, the self-test proves a full-depth clamp leaves nothing behind, and Gate C reports the leak when the embedding is left out.
+- **Fine question became a string match.** Partly applies. The leaf question names the leaf ("Is the item above an oak?"). With the clamp starting at the embedding, the only "oak" left in the prompt is in the question, so a yes means the slot's state reads as *oak*. That is still an identity readout, not semantic knowledge about oaks. Non-lexical property questions are GrainLensSol V2's level, so the two repos cover both.
+- **Native residues (each layer's own update) as the model's own grain.** That is Sol's PROTOCOL_V2 follow-up and is not duplicated here.
 
 ## For Sol
 

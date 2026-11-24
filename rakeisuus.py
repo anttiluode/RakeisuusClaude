@@ -28,14 +28,18 @@ import torch
 
 import concepts as C
 
-MODEL = "Qwen/Qwen2.5-1.5B-Instruct"     # the Qwenimagination checkpoint
+MODEL = "Qwen/Qwen3-1.7B"     # GrainLensSol's checkpoint, so the two repos can be joined
 YES, NO = ["Yes", "yes"], ["No", "no"]
 USER = "Item: {w}\n\n{q} Answer yes or no."
 PREFIX = "Answer:"
 SEED = 20261124
 # Candidate bands for a 28-layer model, inclusive, scaled for other depths.
+# Layer -1 is the token embedding (the input to layer 0). A band starting at -1
+# leaves no copy of the original word anywhere in the forward pass, so no later
+# token can route around the clamp (Neon's bypass). Bands starting at 0 or later
+# are kept to measure how much leaks around them.
 # Qwenimagination V9: concept swaps steer only when the band covers layers 4-12.
-BANDS28 = [(0, 12), (2, 12), (4, 12), (0, 8), (4, 16)]
+BANDS28 = [(-1, 12), (-1, 8), (0, 12), (2, 12), (4, 12), (4, 16)]
 TS = (0.25, 0.5, 0.75, 1.0)
 KS = (1, 2, 4, 8, 16)
 
@@ -46,6 +50,33 @@ def _hs(out):
 
 def _replace(out, new):
     return (new,) + tuple(out[1:]) if isinstance(out, tuple) else new
+
+
+class Track:
+    """One word's states: track[-1] is the embedding, track[l] the output of layer l."""
+
+    def __init__(self, t):
+        self.t = t                      # [L + 1, d]
+        self.shape = t.shape
+
+    def __getitem__(self, l):
+        return self.t[l + 1]
+
+
+def _pre_hook(pos, v=None, store=None):
+    """Read or overwrite the embedding at `pos` (the input of layer 0)."""
+    def hook(mod, args, kwargs):
+        h = args[0] if args else kwargs["hidden_states"]
+        if store is not None:
+            store[-1] = h[0, pos].detach().float().cpu()
+            return None
+        h = h.clone()
+        h[:, pos] = v.to(h.device, h.dtype)
+        if args:
+            return (h,) + tuple(args[1:]), kwargs
+        kwargs["hidden_states"] = h
+        return args, kwargs
+    return hook
 
 
 # ============================================================== model access
@@ -93,18 +124,20 @@ class Lm:
 
     @torch.no_grad()
     def states(self, word):
-        """Residual stream after every layer at the word's position: [L, d], float32, cpu."""
+        """Embedding and residual stream after every layer at the word's position."""
         ids, pos = self.prompt(word, C.TOPS[0][1])
         store = {}
         hooks = [self.layers[l].register_forward_hook(
             lambda m, i, o, l=l: store.__setitem__(l, _hs(o)[0, pos].detach().float().cpu()))
             for l in range(self.n_layers)]
+        hooks.append(self.layers[0].register_forward_pre_hook(_pre_hook(pos, store=store),
+                                                              with_kwargs=True))
         try:
             self.model.model(input_ids=torch.tensor([ids], device=self.device))
         finally:
             for h in hooks:
                 h.remove()
-        return torch.stack([store[l] for l in range(self.n_layers)])
+        return Track(torch.stack([store[l] for l in range(-1, self.n_layers)]))
 
     @torch.no_grad()
     def margins(self, word, questions, targets=None):
@@ -122,6 +155,11 @@ class Lm:
         last = mask.sum(1) - 1
         hooks = []
         for l, v in (targets or {}).items():
+            if l == -1:
+                hooks.append(self.layers[0].register_forward_pre_hook(_pre_hook(pos, v),
+                                                                      with_kwargs=True))
+                continue
+
             def hook(mod, inp, out, v=v):
                 h = _hs(out).clone()
                 h[:, pos] = v.to(h.device, h.dtype)
@@ -287,7 +325,7 @@ def unit(seed, d):
 def gate0(tree, S, n_layers):
     """Is the tree in the geometry, layer by layer?"""
     rows = []
-    for l in range(n_layers):
+    for l in range(-1, n_layers):
         leaves = [L["word"] for L in tree.leaves]
         mu = torch.stack([S[w][l] for w in leaves]).mean(0)
 
@@ -323,7 +361,8 @@ def gate0(tree, S, n_layers):
 def scale_bands(n_layers):
     out = []
     for a, b in BANDS28:
-        a2, b2 = round(a * n_layers / 28), min(n_layers - 1, round(b * n_layers / 28))
+        a2 = a if a < 0 else round(a * n_layers / 28)
+        b2 = min(n_layers - 1, round(b * n_layers / 28))
         if (a2, b2) not in out and a2 <= b2:
             out.append((a2, b2))
     return out
@@ -495,15 +534,24 @@ def run(lm, out_dir, max_leaves=None, log=print):
                            printed_ok=b_test["top"] >= 0.9 and b_test["cat"] >= 0.8 and b_test["leaf"] >= 0.8)
     log(f"\nGate C: printed word, test leaves: top {b_test['top']:.2f}  cat {b_test['cat']:.2f}  "
         f"leaf {b_test['leaf']:.2f}  (chance {chance['top']:.2f} / {chance['cat']:.2f} / {chance['leaf']:.2f})")
-    bands = {}
+    bands, band_of = {}, {}
     for band in scale_bands(lm.n_layers):
+        band_of[f"L{band[0]}-{band[1]}"] = band
         bands[f"L{band[0]}-{band[1]}"] = r = transplant(lm, tree, S, train, band)
         log(f"  band L{band[0]}-{band[1]} transplant on train: sibling leaf {r['sibling_leaf']:.2f}  "
             f"cross cat {fmt(r['cross_cat'])}  cross top {fmt(r['cross_top'])}")
+    e, z = scale_bands(lm.n_layers)[0], scale_bands(lm.n_layers)[2]
+    leak = {k: bands[f"L{z[0]}-{z[1]}"][k] - bands[f"L{e[0]}-{e[1]}"][k]
+            for k in ("sibling_leaf", "score")}
+    report_leak = dict(with_embedding=f"L{e[0]}-{e[1]}", without=f"L{z[0]}-{z[1]}",
+                       change_when_embedding_left_out=leak)
+    log(f"  leaving the embedding out of the clamp changes sibling-leaf transplant by "
+        f"{leak['sibling_leaf']:+.2f} (negative = the original word leaks around the clamp)")
     key = max(bands, key=lambda k: bands[k]["score"])
-    band = tuple(int(x) for x in key[1:].split("-"))
+    band = band_of[key]
     tt = transplant(lm, tree, S, test, band)
     report["gateC"].update(bands_train=bands, chosen_band=list(band), transplant_test=tt,
+                           embedding_leak=report_leak,
                            pass_leaf=tt["sibling_leaf"] >= 0.5)
     log(f"  chosen {key}; on test leaves: sibling leaf {tt['sibling_leaf']:.2f}  "
         f"cross cat {fmt(tt['cross_cat'])}  cross top {fmt(tt['cross_top'])}"
@@ -621,6 +669,14 @@ def self_test():
     hk.remove()
     assert torch.allclose(clean[0, :pos], seen["h"][0, :pos]), "positions before the word moved"
     assert not torch.allclose(clean[0, pos + 1:], seen["h"][0, pos + 1:]), "later positions did not move"
+    # 2b. no bypass: clamping another word from the embedding through every layer
+    #     gives exactly that word's own answers, so nothing of the original survives
+    full = (-1, lm.n_layers - 1)
+    own = lm.margins(other, [(k, q) for k, q in qs if not k.startswith("leaf:")])
+    via = lm.margins(L["word"], [(k, q) for k, q in qs if not k.startswith("leaf:")],
+                     clamp(S, other, full))
+    assert max(abs(own[k] - via[k]) for k in own) < 1e-4, "the original word leaked around the clamp"
+    assert band[0] == -1, "first candidate band should start at the embedding"
     # 3. batched margins equal one-at-a-time margins (padding is harmless)
     one = {k: lm.margins(L["word"], [(k, q)])[k] for k, q in qs[:3]}
     assert all(abs(one[k] - a[k]) < 1e-4 for k in one), "padding changed the answer"
